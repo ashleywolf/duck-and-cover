@@ -32,12 +32,49 @@
     margin-top: 32px; font-size: 18px; color: #aaa; text-align: center; line-height: 1.6;
   }
   #startOverlay .error { color: #f66; margin-top: 16px; font-size: 16px; }
+  .gh-input-group { display:flex; align-items:center; gap:10px; margin:16px 0; }
+  .gh-input-group input {
+    background:#1a1a2e; border:1px solid #444; color:#fff;
+    padding:8px 12px; border-radius:6px; font-size:14px; width:200px; outline:none;
+  }
+  .gh-input-group input:focus { border-color:#ffd700; }
+  .gh-input-group input::placeholder { color:#666; }
+  .gh-avatar-preview {
+    width:32px; height:32px; border-radius:50%; border:2px solid #444; display:none;
+  }
+  #gameOverOverlay {
+    position:fixed; inset:0; z-index:100;
+    background:rgba(0,0,0,0.88);
+    display:none; flex-direction:column; align-items:center; justify-content:center;
+    color:#fff; overflow-y:auto; padding:20px;
+    font-family:'Segoe UI',Arial,sans-serif;
+  }
+  .lb-box { border:2px solid #ffd700; border-radius:10px; padding:14px 18px; background:rgba(0,0,0,0.5); max-width:520px; width:100%; }
+  .lb-box.compact { max-width:320px; }
+  .lb-box h3 { font-size:20px; color:#ffd700; margin:0 0 10px; font-weight:bold; }
+  .lb-tbl { width:100%; border-collapse:collapse; }
+  .lb-tbl th { color:#888; font-size:11px; text-transform:uppercase; font-weight:normal; padding:3px 6px; text-align:left; }
+  .lb-tbl th.r, .lb-tbl td.r { text-align:right; }
+  .lb-tbl td { padding:4px 6px; font-size:14px; color:#ddd; }
+  .lb-tbl tr.hl { color:#ffd700 !important; background:rgba(255,215,0,0.1); }
+  .lb-tbl tr.hl td { color:#ffd700; }
+  .lb-tbl .rk { color:#ffd700; width:24px; }
+  .save-btn {
+    font-size:16px; padding:10px 24px; background:#ffd700; color:#000;
+    border:none; border-radius:6px; cursor:pointer; font-weight:700;
+  }
+  .save-btn:hover { transform:scale(1.03); }
+  .save-btn:disabled { background:#4a4; color:#fff; cursor:default; transform:none; }
 </style>
 </head>
 <body>
 <div id="startOverlay">
   <h1>DUCK &amp; COVER</h1>
   <div class="sub">Prairie dog with a death wish</div>
+  <div class="gh-input-group">
+    <img id="avatarPreview" class="gh-avatar-preview" alt="">
+    <input id="githubUsername" type="text" placeholder="GitHub username" spellcheck="false" autocomplete="off">
+  </div>
   <button id="startBtn">START GAME</button>
   <div class="instructions">
     <strong>DUCK</strong> below the camera to dodge<br>
@@ -45,8 +82,13 @@
     Don't get hit. Build combos. Survive.
   </div>
   <div id="highScoreDisplay" style="margin-top:16px;font-size:18px;color:#ffd700;"></div>
+  <div class="lb-box compact" style="margin-top:16px;">
+    <h3>&#127942; TOP SCORES</h3>
+    <div id="titleLeaderboard"></div>
+  </div>
   <div id="errorMsg" class="error"></div>
 </div>
+<div id="gameOverOverlay"></div>
 <video id="webcam" autoplay playsinline></video>
 <canvas id="gameCanvas"></canvas>
 
@@ -121,6 +163,174 @@ let newHighScore = false;
 // High score from localStorage
 let savedHighScore = null;
 try { savedHighScore = JSON.parse(localStorage.getItem('duckAndCover_highScore')); } catch(e) {}
+
+// ─── LEADERBOARD ───
+
+let leaderboardSaved = false;
+let currentGameId = null;
+
+window._avFail = function(el) {
+  el.onerror = null;
+  const sz = el.width || 24;
+  const span = document.createElement('span');
+  span.style.cssText = 'display:inline-block;width:'+sz+'px;height:'+sz+'px;border-radius:50%;background:#555;vertical-align:middle;';
+  el.replaceWith(span);
+};
+
+function getGitHubUsername() {
+  try { return localStorage.getItem('github_username') || ''; } catch(e) { return ''; }
+}
+
+function setGitHubUsername(name) {
+  try { localStorage.setItem('github_username', name); } catch(e) {}
+}
+
+function loadLeaderboard() {
+  try { return JSON.parse(localStorage.getItem('duckAndCover_leaderboard')) || []; } catch(e) { return []; }
+}
+
+function saveLeaderboard(board) {
+  try { localStorage.setItem('duckAndCover_leaderboard', JSON.stringify(board)); } catch(e) {}
+}
+
+function qualifiesForLeaderboard(s) {
+  if (s <= 0) return false;
+  const board = loadLeaderboard();
+  if (board.length < 10) return true;
+  return s > board[board.length - 1].score;
+}
+
+function addToLeaderboard(entry) {
+  const board = loadLeaderboard();
+  board.push(entry);
+  board.sort((a, b) => b.score - a.score);
+  if (board.length > 10) board.length = 10;
+  saveLeaderboard(board);
+  return board;
+}
+
+function fmtDate(d) {
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const dt = new Date(d);
+  return months[dt.getMonth()] + ' ' + dt.getDate();
+}
+
+function avatarImg(username, size) {
+  if (!username) return '<span style="display:inline-block;width:'+size+'px;height:'+size+'px;border-radius:50%;background:#555;vertical-align:middle;"></span>';
+  return '<img src="https://github.com/'+username+'.png?size='+(size*2)+'" width="'+size+'" height="'+size+'" style="border-radius:50%;vertical-align:middle;" onerror="_avFail(this)">';
+}
+
+function showGameOverOverlay() {
+  const el = document.getElementById('gameOverOverlay');
+  const username = getGitHubUsername();
+  const qualifies = qualifiesForLeaderboard(score);
+
+  let h = '';
+  h += '<h1 style="font-size:60px;font-weight:900;color:#f44;text-shadow:0 0 30px rgba(255,60,60,0.5),0 3px 0 #900;margin:0 0 6px;">GAME OVER</h1>';
+  if (newHighScore) h += '<div style="font-size:28px;color:#ffd700;font-weight:bold;margin-bottom:6px;">NEW HIGH SCORE!</div>';
+  h += '<div style="font-size:42px;font-weight:bold;margin-bottom:8px;">SCORE: '+score+'</div>';
+  h += '<div style="font-size:16px;color:#ccc;line-height:1.7;margin-bottom:4px;">';
+  h += 'Max Combo: x'+maxCombo+' &nbsp;|&nbsp; Dodges: '+totalDodges+' &nbsp;|&nbsp; Shots: '+totalShots+' &nbsp;|&nbsp; Kills: '+totalKills+'<br>';
+  h += 'Phase Reached: '+phase+'</div>';
+  if (savedHighScore) {
+    h += '<div style="font-size:14px;color:#ffd700;margin-bottom:8px;">Best: '+savedHighScore.score+' (x'+savedHighScore.maxCombo+' combo, phase '+savedHighScore.phase+')</div>';
+  }
+
+  h += '<div style="margin:12px 0;">';
+  if (leaderboardSaved) {
+    h += '<button class="save-btn" disabled>\u2713 Saved!</button>';
+  } else if (username && qualifies) {
+    h += '<button class="save-btn" id="saveScoreBtn">Save to Leaderboard</button>';
+  } else if (!username) {
+    h += '<div style="color:#999;font-size:13px;">Enter username on title screen to save scores</div>';
+  } else {
+    h += '<div style="color:#999;font-size:13px;">Score doesn\'t qualify for top 10</div>';
+  }
+  h += '</div>';
+
+  const board = loadLeaderboard();
+  h += '<div class="lb-box">';
+  h += '<h3>\u{1F3C6} LEADERBOARD</h3>';
+  if (board.length === 0) {
+    h += '<div style="color:#888;font-size:13px;">No scores yet. Be the first!</div>';
+  } else {
+    h += '<table class="lb-tbl"><tr><th>#</th><th></th><th>Player</th><th class="r">Score</th><th class="r">Combo</th><th class="r">Phase</th><th class="r">Date</th></tr>';
+    board.forEach(function(e, i) {
+      var cls = e.id === currentGameId ? ' class="hl"' : '';
+      h += '<tr'+cls+'><td class="rk">'+(i+1)+'</td><td>'+avatarImg(e.username,24)+'</td><td>'+(e.username||'Anonymous')+'</td><td class="r">'+e.score+'</td><td class="r">x'+e.bestCombo+'</td><td class="r">'+e.phase+'</td><td class="r">'+fmtDate(e.date)+'</td></tr>';
+    });
+    h += '</table>';
+  }
+  h += '</div>';
+  h += '<div style="margin-top:16px;font-size:22px;color:#ff0;font-weight:bold;">Press R to restart</div>';
+
+  el.innerHTML = h;
+  el.style.display = 'flex';
+
+  const saveBtn = document.getElementById('saveScoreBtn');
+  if (saveBtn) {
+    saveBtn.addEventListener('click', function() {
+      addToLeaderboard({
+        username: username,
+        avatar: 'https://github.com/'+username+'.png?size=48',
+        score: score,
+        bestCombo: maxCombo,
+        phase: phase,
+        date: new Date().toISOString(),
+        id: currentGameId
+      });
+      leaderboardSaved = true;
+      showGameOverOverlay();
+    });
+  }
+}
+
+function hideGameOverOverlay() {
+  document.getElementById('gameOverOverlay').style.display = 'none';
+}
+
+function renderTitleLeaderboard() {
+  const container = document.getElementById('titleLeaderboard');
+  if (!container) return;
+  const board = loadLeaderboard().slice(0, 5);
+  if (board.length === 0) {
+    container.innerHTML = '<div style="color:#888;font-size:13px;">No scores yet</div>';
+    return;
+  }
+  let h = '<table class="lb-tbl">';
+  board.forEach(function(e, i) {
+    h += '<tr><td class="rk">'+(i+1)+'</td><td>'+avatarImg(e.username,20)+'</td><td>'+(e.username||'Anon')+'</td><td class="r" style="color:#fff;">'+e.score+'</td></tr>';
+  });
+  h += '</table>';
+  container.innerHTML = h;
+}
+
+function initUsernameInput() {
+  const input = document.getElementById('githubUsername');
+  const preview = document.getElementById('avatarPreview');
+  if (!input || !preview) return;
+  const stored = getGitHubUsername();
+  if (stored) {
+    input.value = stored;
+    preview.src = 'https://github.com/'+stored+'.png?size=40';
+    preview.style.display = 'block';
+  }
+  let timer;
+  input.addEventListener('input', function() {
+    const v = input.value.trim();
+    setGitHubUsername(v);
+    clearTimeout(timer);
+    if (v) {
+      timer = setTimeout(function() {
+        preview.src = 'https://github.com/'+v+'.png?size=40';
+        preview.style.display = 'block';
+      }, 400);
+    } else {
+      preview.style.display = 'none';
+    }
+  });
+  preview.addEventListener('error', function() { preview.style.display = 'none'; });
+}
 
 let calibrationSamples = [];
 let countdownValue = 3;
@@ -1238,7 +1448,6 @@ function drawHUD(now) {
 }
 
 function drawGameOver(now) {
-  // Save high score on first frame of game over
   if (!gameOverSaved) {
     gameOverSaved = true;
     const isNew = !savedHighScore || score > savedHighScore.score;
@@ -1247,54 +1456,13 @@ function drawGameOver(now) {
       localStorage.setItem('duckAndCover_highScore', JSON.stringify(savedHighScore));
     }
     newHighScore = isNew && score > 0;
+    leaderboardSaved = false;
+    currentGameId = Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+    showGameOverOverlay();
   }
 
   ctx.fillStyle = 'rgba(0,0,0,0.7)';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-  ctx.textAlign = 'center';
-  ctx.font = 'bold 72px Segoe UI, Arial, sans-serif';
-  ctx.fillStyle = '#f44';
-  ctx.strokeStyle = 'rgba(0,0,0,0.8)';
-  ctx.lineWidth = 4;
-  ctx.strokeText('GAME OVER', canvas.width / 2, canvas.height / 2 - 100);
-  ctx.fillText('GAME OVER', canvas.width / 2, canvas.height / 2 - 100);
-
-  if (newHighScore) {
-    ctx.font = 'bold 36px Segoe UI, Arial, sans-serif';
-    ctx.fillStyle = '#ffd700';
-    const pulse = 1 + Math.sin(now * 0.005) * 0.1;
-    ctx.save();
-    ctx.translate(canvas.width / 2, canvas.height / 2 - 55);
-    ctx.scale(pulse, pulse);
-    ctx.fillText('NEW HIGH SCORE!', 0, 0);
-    ctx.restore();
-  }
-
-  ctx.font = 'bold 48px Segoe UI, Arial, sans-serif';
-  ctx.fillStyle = '#fff';
-  ctx.fillText(`SCORE: ${score}`, canvas.width / 2, canvas.height / 2 - 10);
-
-  ctx.font = '24px Segoe UI, Arial, sans-serif';
-  ctx.fillStyle = '#ccc';
-  const stats = [
-    `Max Combo: x${maxCombo}`,
-    `Dodges: ${totalDodges}  |  Shots: ${totalShots}  |  Kills: ${totalKills}`,
-    `Phase Reached: ${phase}`,
-  ];
-  stats.forEach((s, i) => {
-    ctx.fillText(s, canvas.width / 2, canvas.height / 2 + 35 + i * 32);
-  });
-
-  if (savedHighScore) {
-    ctx.font = '20px Segoe UI, Arial, sans-serif';
-    ctx.fillStyle = '#ffd700';
-    ctx.fillText(`Best: ${savedHighScore.score} (x${savedHighScore.maxCombo} combo, phase ${savedHighScore.phase})`, canvas.width / 2, canvas.height / 2 + 140);
-  }
-
-  ctx.font = 'bold 28px Segoe UI, Arial, sans-serif';
-  ctx.fillStyle = '#ff0';
-  ctx.fillText('Press R to restart', canvas.width / 2, canvas.height / 2 + 190);
 }
 
 // ─── POSE PROCESSING ───
@@ -1398,6 +1566,9 @@ window.addEventListener('keydown', (e) => {
     if (gameState === 'gameover') {
       gameOverSaved = false;
       newHighScore = false;
+      leaderboardSaved = false;
+      currentGameId = null;
+      hideGameOverOverlay();
       startCalibration();
     }
   }
@@ -1416,6 +1587,8 @@ if (savedHighScore) {
   document.getElementById('highScoreDisplay').textContent = 
     `Best: ${savedHighScore.score} | Combo: x${savedHighScore.maxCombo} | Phase ${savedHighScore.phase}`;
 }
+initUsernameInput();
+renderTitleLeaderboard();
 
 startBtn.addEventListener('click', async () => {
   startBtn.disabled = true;

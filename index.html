@@ -1,0 +1,1113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Duck & Cover</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; overflow: hidden; font-family: 'Segoe UI', Arial, sans-serif; }
+  canvas { display: block; }
+  video { display: none; }
+  #startOverlay {
+    position: fixed; inset: 0; z-index: 100;
+    background: rgba(0,0,0,0.85);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    color: #fff;
+  }
+  #startOverlay h1 {
+    font-size: 72px; font-weight: 900; letter-spacing: 4px;
+    text-shadow: 0 0 40px rgba(255,60,60,0.6), 0 4px 0 #900;
+    margin-bottom: 20px;
+  }
+  #startOverlay .sub { font-size: 22px; color: #ccc; margin-bottom: 40px; }
+  #startOverlay button {
+    font-size: 28px; padding: 16px 48px;
+    background: #e33; color: #fff; border: none; border-radius: 8px;
+    cursor: pointer; font-weight: 700; letter-spacing: 2px;
+    transition: transform 0.1s;
+  }
+  #startOverlay button:hover { transform: scale(1.05); background: #f44; }
+  #startOverlay .instructions {
+    margin-top: 32px; font-size: 18px; color: #aaa; text-align: center; line-height: 1.6;
+  }
+  #startOverlay .error { color: #f66; margin-top: 16px; font-size: 16px; }
+</style>
+</head>
+<body>
+<div id="startOverlay">
+  <h1>DUCK &amp; COVER</h1>
+  <div class="sub">Prairie dog with a death wish</div>
+  <button id="startBtn">START GAME</button>
+  <div class="instructions">
+    <strong>DUCK</strong> below the camera to dodge<br>
+    Pop up and <strong>YELL</strong> to shoot back<br>
+    Don't get hit. Build combos. Survive.
+  </div>
+  <div id="errorMsg" class="error"></div>
+</div>
+<video id="webcam" autoplay playsinline></video>
+<canvas id="gameCanvas"></canvas>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.mjs";
+
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const video = document.getElementById('webcam');
+const startOverlay = document.getElementById('startOverlay');
+const startBtn = document.getElementById('startBtn');
+const errorMsg = document.getElementById('errorMsg');
+
+// ─── CONSTANTS ───
+
+const DUCK_THRESHOLD = 0.68;
+const STAND_THRESHOLD = 0.52;
+const VOLUME_THRESHOLD = 100;
+const VOLUME_SUSTAIN_MS = 80;
+const SHOOT_COOLDOWN_MS = 500;
+const HIT_INVULN_MS = 1000;
+const MAX_HEALTH = 3;
+const PROJECTILE_TRAVEL_MS = 2200;
+const PROJECTILE_MIN_SIZE = 12;
+const PROJECTILE_MAX_SIZE = 80;
+
+// ─── STATE ───
+
+let poseLandmarker = null;
+let audioCtx = null;
+let analyser = null;
+let volumeAboveStart = 0;
+let lastShotTime = 0;
+
+let gameState = 'idle'; // idle, calibrating, countdown, playing, gameover
+let noseY = 0.3;
+let noseBaseline = 0.35;
+let isStanding = true;
+let wasDucking = false;
+let duckDebounceTime = 0;
+const DUCK_DEBOUNCE_MS = 120;
+
+let health = MAX_HEALTH;
+let score = 0;
+let combo = 0;
+let maxCombo = 0;
+let comboActions = [];
+let wave = 1;
+let phase = 1;
+let projectilesSpawned = 0;
+let lastSpawnTime = 0;
+let invulnUntil = 0;
+
+let projectiles = [];
+let particles = [];
+let textPopups = [];
+let screenShake = { x: 0, y: 0, until: 0 };
+let screenFlash = { color: '', alpha: 0 };
+let borderGlow = 0;
+let muzzleFlash = 0;
+let crosshairPulse = 0;
+
+let calibrationSamples = [];
+let countdownValue = 3;
+let countdownStart = 0;
+
+let totalDodges = 0;
+let totalShots = 0;
+let totalKills = 0;
+
+// ─── RESIZE ───
+
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ─── AUDIO SETUP ───
+
+async function setupAudio() {
+  audioCtx = new AudioContext();
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const source = audioCtx.createMediaStreamSource(stream);
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 256;
+  source.connect(analyser);
+}
+
+function getVolume() {
+  if (!analyser) return 0;
+  const data = new Uint8Array(analyser.frequencyBinCount);
+  analyser.getByteFrequencyData(data);
+  let sum = 0;
+  for (let i = 0; i < data.length; i++) sum += data[i];
+  return sum / data.length;
+}
+
+// ─── SOUND FX ───
+
+function playTone(freq, duration, type = 'sine', vol = 0.15) {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+  gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + duration);
+}
+
+function playWhoosh() {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = 'sawtooth';
+  osc.frequency.setValueAtTime(500, audioCtx.currentTime);
+  osc.frequency.exponentialRampToValueAtTime(80, audioCtx.currentTime + 0.2);
+  gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.25);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + 0.25);
+}
+
+function playShootSound() {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = 'square';
+  osc.frequency.setValueAtTime(2000, audioCtx.currentTime);
+  osc.frequency.exponentialRampToValueAtTime(200, audioCtx.currentTime + 0.08);
+  gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.1);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + 0.1);
+}
+
+function playHitSound() {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = 'sawtooth';
+  osc.frequency.setValueAtTime(80, audioCtx.currentTime);
+  gain.gain.setValueAtTime(0.25, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.35);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + 0.35);
+  // glass break noise
+  const buf = audioCtx.createBuffer(1, audioCtx.sampleRate * 0.15, audioCtx.sampleRate);
+  const ch = buf.getChannelData(0);
+  for (let i = 0; i < ch.length; i++) ch[i] = (Math.random() * 2 - 1) * (1 - i / ch.length);
+  const noise = audioCtx.createBufferSource();
+  noise.buffer = buf;
+  const ng = audioCtx.createGain();
+  ng.gain.setValueAtTime(0.12, audioCtx.currentTime);
+  ng.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.15);
+  noise.connect(ng);
+  ng.connect(audioCtx.destination);
+  noise.start();
+}
+
+function playComboChime() {
+  playTone(400, 0.1, 'sine', 0.1);
+  setTimeout(() => playTone(600, 0.1, 'sine', 0.1), 80);
+  setTimeout(() => playTone(800, 0.15, 'sine', 0.12), 160);
+}
+
+function playGameOverSound() {
+  playTone(400, 0.3, 'sine', 0.12);
+  setTimeout(() => playTone(300, 0.3, 'sine', 0.12), 250);
+  setTimeout(() => playTone(200, 0.5, 'sine', 0.12), 500);
+  setTimeout(() => playTone(150, 0.8, 'sine', 0.1), 750);
+}
+
+function playApproachingSound(progress) {
+  const freq = 100 + progress * 400;
+  playTone(freq, 0.08, 'sine', 0.03 + progress * 0.04);
+}
+
+function playCountdownBeep(final) {
+  playTone(final ? 880 : 440, final ? 0.3 : 0.15, 'sine', 0.15);
+}
+
+// ─── MEDIAPIPE SETUP ───
+
+async function setupPose() {
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+  );
+  poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+      delegate: "GPU"
+    },
+    runningMode: "VIDEO",
+    numPoses: 1
+  });
+}
+
+// ─── WEBCAM ───
+
+async function setupWebcam() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }
+  });
+  video.srcObject = stream;
+  await new Promise(r => { video.onloadeddata = r; });
+  video.play();
+}
+
+// ─── PROJECTILE TYPES ───
+
+function createProjectile() {
+  const types = getProjectileTypesForPhase();
+  const type = types[Math.floor(Math.random() * types.length)];
+  const lane = Math.random();
+  const targetX = canvas.width * (0.2 + lane * 0.6);
+  const targetY = canvas.height * 0.7;
+  const startX = canvas.width * 0.5 + (targetX - canvas.width * 0.5) * 0.1;
+  const startY = canvas.height * 0.25;
+  const speed = getSpeedForPhase();
+
+  return {
+    type, // 'rock', 'target', 'bomb'
+    x: startX, y: startY,
+    targetX, targetY,
+    startX, startY,
+    progress: 0,
+    speed,
+    size: PROJECTILE_MIN_SIZE,
+    alive: true,
+    flashTimer: 0,
+    lastSoundAt: 0,
+  };
+}
+
+function getProjectileTypesForPhase() {
+  if (phase === 1) return ['rock', 'rock', 'rock', 'target'];
+  if (phase === 2) return ['rock', 'rock', 'target', 'target', 'bomb'];
+  if (phase === 3) return ['rock', 'target', 'target', 'bomb', 'bomb'];
+  return ['rock', 'target', 'bomb', 'bomb', 'target'];
+}
+
+function getSpeedForPhase() {
+  if (phase === 1) return 0.45;
+  if (phase === 2) return 0.55;
+  if (phase === 3) return 0.65;
+  return 0.8;
+}
+
+function getSpawnIntervalForPhase() {
+  if (phase === 1) return 2800;
+  if (phase === 2) return 1800;
+  if (phase === 3) return 1200;
+  return 700;
+}
+
+function getMaxActiveForPhase() {
+  if (phase === 1) return 1;
+  if (phase === 2) return 2;
+  if (phase === 3) return 3;
+  return 4;
+}
+
+// ─── PARTICLES ───
+
+function spawnExplosion(x, y, color, count = 20) {
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 2 + Math.random() * 6;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      life: 1,
+      decay: 0.015 + Math.random() * 0.025,
+      size: 3 + Math.random() * 5,
+      color,
+    });
+  }
+}
+
+function spawnDodgeStreaks() {
+  for (let i = 0; i < 8; i++) {
+    const side = Math.random() < 0.5 ? 0 : canvas.width;
+    const y = canvas.height * 0.3 + Math.random() * canvas.height * 0.4;
+    particles.push({
+      x: side, y,
+      vx: side === 0 ? 12 + Math.random() * 8 : -(12 + Math.random() * 8),
+      vy: (Math.random() - 0.5) * 2,
+      life: 1,
+      decay: 0.04,
+      size: 2,
+      color: '#8cf',
+      streak: true,
+    });
+  }
+}
+
+function spawnComboBreak(x, y) {
+  for (let i = 0; i < 30; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 1 + Math.random() * 4;
+    particles.push({
+      x: x + (Math.random() - 0.5) * 100,
+      y: y + (Math.random() - 0.5) * 60,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed + 2,
+      life: 1,
+      decay: 0.01 + Math.random() * 0.02,
+      size: 4 + Math.random() * 8,
+      color: '#fff',
+      triangle: true,
+    });
+  }
+}
+
+// ─── TEXT POPUPS ───
+
+function addPopup(text, x, y, color = '#fff', size = 48, duration = 0.8) {
+  textPopups.push({ text, x, y, color, size, life: 1, decay: 1 / (duration * 60) });
+}
+
+// ─── GAME LOGIC ───
+
+function detectDuckState(now) {
+  if (now - duckDebounceTime < DUCK_DEBOUNCE_MS) return;
+
+  const prevStanding = isStanding;
+  if (noseY > DUCK_THRESHOLD && isStanding) {
+    isStanding = false;
+    duckDebounceTime = now;
+  } else if (noseY < STAND_THRESHOLD && !isStanding) {
+    isStanding = true;
+    wasDucking = true;
+    duckDebounceTime = now;
+  }
+}
+
+function detectShoot(now) {
+  if (!isStanding) { volumeAboveStart = 0; return false; }
+  if (now - lastShotTime < SHOOT_COOLDOWN_MS) return false;
+
+  const vol = getVolume();
+  if (vol > VOLUME_THRESHOLD) {
+    if (volumeAboveStart === 0) volumeAboveStart = now;
+    if (now - volumeAboveStart >= VOLUME_SUSTAIN_MS) {
+      volumeAboveStart = 0;
+      lastShotTime = now;
+      return true;
+    }
+  } else {
+    volumeAboveStart = 0;
+  }
+  return false;
+}
+
+function shootNearest() {
+  let nearest = null;
+  let bestProgress = 0;
+  for (const p of projectiles) {
+    if (!p.alive) continue;
+    if (p.type === 'rock') continue; // can't shoot rocks
+    if (p.progress > bestProgress) {
+      bestProgress = p.progress;
+      nearest = p;
+    }
+  }
+  // if no targets/bombs, shoot any (including rocks at high phases)
+  if (!nearest) {
+    for (const p of projectiles) {
+      if (!p.alive) continue;
+      if (p.progress > bestProgress) {
+        bestProgress = p.progress;
+        nearest = p;
+      }
+    }
+  }
+  if (nearest) {
+    nearest.alive = false;
+    const color = nearest.type === 'rock' ? '#999' : nearest.type === 'bomb' ? '#f80' : '#f44';
+    spawnExplosion(nearest.x, nearest.y, color, 25);
+    addPopup('+' + (15 * Math.max(1, combo)), nearest.x, nearest.y - 20, '#ff0', 36);
+    score += 15 * Math.max(1, combo);
+    totalKills++;
+    combo++;
+    comboActions.push('BANG!');
+    if (comboActions.length > 5) comboActions.shift();
+    if (combo % 5 === 0 && combo > 0) playComboChime();
+    if (combo > maxCombo) maxCombo = combo;
+  }
+}
+
+function handleProjectileReached(p, now) {
+  if (p.type === 'bomb') {
+    // bombs always hit, ducking doesn't help
+    takeDamage(now, p);
+    return;
+  }
+
+  if (!isStanding) {
+    // DODGED
+    score += 5 * Math.max(1, combo);
+    combo++;
+    totalDodges++;
+    comboActions.push('DODGE!');
+    if (comboActions.length > 5) comboActions.shift();
+    if (combo % 5 === 0 && combo > 0) playComboChime();
+    if (combo > maxCombo) maxCombo = combo;
+    addPopup('DODGED!', p.x, p.y, '#0f0', 42);
+    playWhoosh();
+    spawnDodgeStreaks();
+    screenFlash = { color: '0,255,80', alpha: 0.15 };
+  } else {
+    takeDamage(now, p);
+  }
+}
+
+function takeDamage(now, p) {
+  if (now < invulnUntil) return;
+  health--;
+  invulnUntil = now + HIT_INVULN_MS;
+  screenShake = { x: 0, y: 0, until: now + 300 };
+  screenFlash = { color: '255,0,0', alpha: 0.35 };
+  playHitSound();
+  addPopup('OUCH!', canvas.width / 2, canvas.height / 2, '#f33', 64, 1);
+  spawnExplosion(p.x, p.y, '#f00', 15);
+  if (combo >= 3) {
+    spawnComboBreak(canvas.width / 2, canvas.height * 0.35);
+    addPopup('COMBO BREAK!', canvas.width / 2, canvas.height * 0.3, '#f88', 36, 1.2);
+  }
+  combo = 0;
+  comboActions = [];
+  if (health <= 0) {
+    gameState = 'gameover';
+    playGameOverSound();
+  }
+}
+
+function updatePhase() {
+  if (projectilesSpawned < 6) phase = 1;
+  else if (projectilesSpawned < 16) phase = 2;
+  else if (projectilesSpawned < 30) phase = 3;
+  else phase = 4;
+  wave = phase;
+}
+
+// ─── UPDATE ───
+
+function update(now) {
+  if (gameState !== 'playing') return;
+
+  detectDuckState(now);
+
+  // Spawn projectiles
+  const interval = getSpawnIntervalForPhase();
+  const maxActive = getMaxActiveForPhase();
+  const activeCount = projectiles.filter(p => p.alive).length;
+  if (now - lastSpawnTime > interval && activeCount < maxActive) {
+    projectiles.push(createProjectile());
+    projectilesSpawned++;
+    lastSpawnTime = now;
+    updatePhase();
+  }
+
+  // Update projectiles
+  for (const p of projectiles) {
+    if (!p.alive) continue;
+    const speedMult = 1 + p.progress * 0.8; // perspective acceleration
+    p.progress += (p.speed / PROJECTILE_TRAVEL_MS) * 16.67 * speedMult;
+    p.progress = Math.min(p.progress, 1);
+
+    const t = p.progress;
+    p.x = p.startX + (p.targetX - p.startX) * t;
+    p.y = p.startY + (p.targetY - p.startY) * t;
+    p.size = PROJECTILE_MIN_SIZE + (PROJECTILE_MAX_SIZE - PROJECTILE_MIN_SIZE) * t;
+    p.flashTimer += 0.1;
+
+    // approaching sound
+    if (t > 0.3 && now - p.lastSoundAt > 300) {
+      playApproachingSound(t);
+      p.lastSoundAt = now;
+    }
+
+    if (p.progress >= 1) {
+      p.alive = false;
+      handleProjectileReached(p, now);
+    }
+  }
+
+  // Shoot detection
+  if (detectShoot(now)) {
+    totalShots++;
+    shootNearest();
+    playShootSound();
+    muzzleFlash = 1;
+    crosshairPulse = 1;
+    addPopup('BANG!', canvas.width / 2, canvas.height / 2 - 60, '#ff0', 56, 0.6);
+  }
+
+  // Clean up dead projectiles
+  projectiles = projectiles.filter(p => p.alive);
+
+  // Update particles
+  for (const p of particles) {
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vy += 0.15;
+    p.life -= p.decay;
+  }
+  particles = particles.filter(p => p.life > 0);
+
+  // Update text popups
+  for (const t of textPopups) {
+    t.life -= t.decay;
+    t.y -= 1.5;
+  }
+  textPopups = textPopups.filter(t => t.life > 0);
+
+  // Screen shake
+  if (now < screenShake.until) {
+    screenShake.x = (Math.random() - 0.5) * 16;
+    screenShake.y = (Math.random() - 0.5) * 16;
+  } else {
+    screenShake.x = 0;
+    screenShake.y = 0;
+  }
+
+  // Screen flash decay
+  if (screenFlash.alpha > 0) screenFlash.alpha -= 0.012;
+
+  // Muzzle flash decay
+  if (muzzleFlash > 0) muzzleFlash -= 0.08;
+  if (crosshairPulse > 0) crosshairPulse -= 0.04;
+
+  // Border glow
+  borderGlow = combo >= 5 ? Math.min(1, borderGlow + 0.03) : Math.max(0, borderGlow - 0.03);
+
+  // Duck visual feedback
+  if (!isStanding && gameState === 'playing') {
+    // brief tint handled in draw
+  }
+}
+
+// ─── DRAW ───
+
+function draw(now) {
+  ctx.save();
+  ctx.translate(screenShake.x, screenShake.y);
+
+  // Webcam background (mirrored)
+  ctx.save();
+  ctx.translate(canvas.width, 0);
+  ctx.scale(-1, 1);
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  ctx.restore();
+
+  // Slight darken overlay for contrast
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  if (gameState === 'calibrating') {
+    drawCalibration(now);
+  } else if (gameState === 'countdown') {
+    drawCountdown(now);
+  } else if (gameState === 'playing') {
+    drawGame(now);
+  } else if (gameState === 'gameover') {
+    drawGameOver(now);
+  }
+
+  ctx.restore();
+}
+
+function drawCalibration(now) {
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 36px Segoe UI, Arial, sans-serif';
+  ctx.fillText('CALIBRATING', canvas.width / 2, canvas.height / 2 - 40);
+  ctx.font = '22px Segoe UI, Arial, sans-serif';
+  ctx.fillStyle = '#ccc';
+  ctx.fillText('Stand normally and look at the camera', canvas.width / 2, canvas.height / 2 + 10);
+
+  const elapsed = now - calibrationStartTime;
+  const progress = Math.min(elapsed / 2000, 1);
+  const barW = 300;
+  ctx.fillStyle = '#333';
+  ctx.fillRect(canvas.width / 2 - barW / 2, canvas.height / 2 + 50, barW, 12);
+  ctx.fillStyle = '#0f0';
+  ctx.fillRect(canvas.width / 2 - barW / 2, canvas.height / 2 + 50, barW * progress, 12);
+
+  // Nose position indicator
+  ctx.fillStyle = '#ff0';
+  ctx.font = '16px Segoe UI, Arial, sans-serif';
+  ctx.fillText(`Nose Y: ${noseY.toFixed(2)}`, canvas.width / 2, canvas.height / 2 + 90);
+}
+
+function drawCountdown(now) {
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 120px Segoe UI, Arial, sans-serif';
+
+  const elapsed = now - countdownStart;
+  const current = 3 - Math.floor(elapsed / 1000);
+
+  if (current > 0) {
+    const frac = (elapsed % 1000) / 1000;
+    const scale = 1 + (1 - frac) * 0.3;
+    ctx.save();
+    ctx.translate(canvas.width / 2, canvas.height / 2);
+    ctx.scale(scale, scale);
+    ctx.globalAlpha = 0.5 + frac * 0.5;
+    ctx.fillText(current.toString(), 0, 40);
+    ctx.restore();
+  } else {
+    const frac = (elapsed - 3000) / 800;
+    if (frac < 1) {
+      ctx.save();
+      ctx.translate(canvas.width / 2, canvas.height / 2);
+      const scale = 1 + frac * 0.5;
+      ctx.scale(scale, scale);
+      ctx.globalAlpha = 1 - frac;
+      ctx.fillStyle = '#f44';
+      ctx.fillText('GO!', 0, 40);
+      ctx.restore();
+    }
+  }
+
+  ctx.globalAlpha = 1;
+  ctx.font = '24px Segoe UI, Arial, sans-serif';
+  ctx.fillStyle = '#ccc';
+  ctx.fillText('DUCK to dodge! YELL to shoot!', canvas.width / 2, canvas.height / 2 + 100);
+}
+
+function drawGame(now) {
+  // Duck indicator zone
+  if (!isStanding) {
+    ctx.fillStyle = 'rgba(0,180,60,0.12)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  }
+
+  // Crosshair
+  const cx = canvas.width / 2;
+  const cy = canvas.height / 2;
+  const crossSize = 20 + crosshairPulse * 10;
+  ctx.strokeStyle = isStanding ? 'rgba(255,255,255,0.6)' : 'rgba(255,255,255,0.2)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(cx - crossSize, cy); ctx.lineTo(cx - 8, cy);
+  ctx.moveTo(cx + 8, cy); ctx.lineTo(cx + crossSize, cy);
+  ctx.moveTo(cx, cy - crossSize); ctx.lineTo(cx, cy - 8);
+  ctx.moveTo(cx, cy + 8); ctx.lineTo(cx, cy + crossSize);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(cx, cy, crossSize * 0.7, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // Muzzle flash
+  if (muzzleFlash > 0) {
+    const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, 100 * muzzleFlash);
+    grad.addColorStop(0, `rgba(255,255,200,${muzzleFlash * 0.7})`);
+    grad.addColorStop(0.5, `rgba(255,200,50,${muzzleFlash * 0.3})`);
+    grad.addColorStop(1, 'rgba(255,200,50,0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  }
+
+  // Projectiles
+  for (const p of projectiles) {
+    if (!p.alive) continue;
+    drawProjectile(p, now);
+  }
+
+  // Particles
+  for (const p of particles) {
+    ctx.globalAlpha = p.life;
+    if (p.triangle) {
+      ctx.fillStyle = p.color;
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.vx * 0.3);
+      ctx.beginPath();
+      ctx.moveTo(0, -p.size / 2);
+      ctx.lineTo(-p.size / 2, p.size / 2);
+      ctx.lineTo(p.size / 2, p.size / 2);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    } else if (p.streak) {
+      ctx.strokeStyle = p.color;
+      ctx.lineWidth = p.size;
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.lineTo(p.x - p.vx * 3, p.y);
+      ctx.stroke();
+    } else {
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  // Text popups
+  for (const t of textPopups) {
+    ctx.globalAlpha = t.life;
+    ctx.textAlign = 'center';
+    ctx.font = `bold ${t.size}px Segoe UI, Arial, sans-serif`;
+    ctx.fillStyle = t.color;
+    ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+    ctx.lineWidth = 3;
+    ctx.strokeText(t.text, t.x, t.y);
+    ctx.fillText(t.text, t.x, t.y);
+  }
+  ctx.globalAlpha = 1;
+
+  // Screen flash
+  if (screenFlash.alpha > 0) {
+    ctx.fillStyle = `rgba(${screenFlash.color},${screenFlash.alpha})`;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  }
+
+  // Border glow for combo x5+
+  if (borderGlow > 0) {
+    const gw = 6;
+    ctx.shadowColor = 'gold';
+    ctx.shadowBlur = 20 * borderGlow;
+    ctx.strokeStyle = `rgba(255,215,0,${borderGlow * 0.8})`;
+    ctx.lineWidth = gw;
+    ctx.strokeRect(gw / 2, gw / 2, canvas.width - gw, canvas.height - gw);
+    ctx.shadowBlur = 0;
+  }
+
+  // Invulnerability flash
+  if (now < invulnUntil) {
+    const blink = Math.sin(now * 0.02) > 0;
+    if (blink) {
+      ctx.fillStyle = 'rgba(255,255,255,0.05)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+  }
+
+  // HUD
+  drawHUD(now);
+}
+
+function drawProjectile(p, now) {
+  ctx.save();
+  ctx.translate(p.x, p.y);
+
+  const s = p.size;
+
+  if (p.type === 'rock') {
+    // Gray circle with craggy look
+    ctx.fillStyle = '#777';
+    ctx.beginPath();
+    ctx.arc(0, 0, s / 2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#555';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    // inner detail
+    ctx.fillStyle = '#666';
+    ctx.beginPath();
+    ctx.arc(-s * 0.12, -s * 0.1, s * 0.18, 0, Math.PI * 2);
+    ctx.fill();
+  } else if (p.type === 'target') {
+    // Red circle with bullseye
+    ctx.fillStyle = '#e22';
+    ctx.beginPath();
+    ctx.arc(0, 0, s / 2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(0, 0, s * 0.32, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#e22';
+    ctx.beginPath();
+    ctx.arc(0, 0, s * 0.16, 0, Math.PI * 2);
+    ctx.fill();
+  } else if (p.type === 'bomb') {
+    // Orange, flashing
+    const flash = Math.sin(now * 0.015) > 0;
+    ctx.fillStyle = flash ? '#fa0' : '#f60';
+    ctx.beginPath();
+    ctx.arc(0, 0, s / 2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#f00';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    // Danger symbol
+    ctx.fillStyle = '#000';
+    ctx.font = `bold ${s * 0.5}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.fillText('!', 0, s * 0.18);
+    // Fuse spark
+    ctx.fillStyle = '#ff0';
+    ctx.beginPath();
+    ctx.arc(s * 0.3, -s * 0.35, 3 + Math.random() * 2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Approach shadow/trail
+  if (p.progress > 0.3) {
+    ctx.globalAlpha = 0.15 * p.progress;
+    ctx.fillStyle = '#000';
+    ctx.beginPath();
+    ctx.ellipse(0, s * 0.4, s * 0.4, s * 0.12, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  ctx.restore();
+}
+
+function drawHUD(now) {
+  const pad = 20;
+  ctx.textAlign = 'left';
+
+  // Health bar
+  const hbW = 200;
+  const hbH = 20;
+  const hbX = canvas.width / 2 - hbW / 2;
+  const hbY = pad;
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(hbX - 2, hbY - 2, hbW + 4, hbH + 4);
+  for (let i = 0; i < MAX_HEALTH; i++) {
+    const segW = (hbW - (MAX_HEALTH - 1) * 4) / MAX_HEALTH;
+    const sx = hbX + i * (segW + 4);
+    ctx.fillStyle = i < health ? '#0f0' : '#400';
+    if (i < health && health === 1) ctx.fillStyle = '#f00';
+    ctx.fillRect(sx, hbY, segW, hbH);
+  }
+
+  // Score
+  ctx.textAlign = 'left';
+  ctx.font = 'bold 28px Segoe UI, Arial, sans-serif';
+  ctx.fillStyle = '#fff';
+  ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+  ctx.lineWidth = 3;
+  ctx.strokeText(`SCORE: ${score}`, pad, pad + 16);
+  ctx.fillText(`SCORE: ${score}`, pad, pad + 16);
+
+  // Wave
+  ctx.textAlign = 'right';
+  ctx.strokeText(`PHASE ${phase}`, canvas.width - pad, pad + 16);
+  ctx.fillText(`PHASE ${phase}`, canvas.width - pad, pad + 16);
+
+  // Combo
+  if (combo > 1) {
+    ctx.textAlign = 'center';
+    const comboSize = Math.min(56, 32 + combo * 3);
+    ctx.font = `bold ${comboSize}px Segoe UI, Arial, sans-serif`;
+    ctx.fillStyle = combo >= 5 ? '#ffd700' : '#fff';
+    ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+    ctx.lineWidth = 4;
+    const comboText = `x${combo} COMBO`;
+    ctx.strokeText(comboText, canvas.width / 2, canvas.height * 0.18);
+    ctx.fillText(comboText, canvas.width / 2, canvas.height * 0.18);
+
+    // Combo action trail
+    if (comboActions.length > 0) {
+      ctx.font = 'bold 16px Segoe UI, Arial, sans-serif';
+      ctx.fillStyle = 'rgba(255,255,255,0.6)';
+      ctx.lineWidth = 2;
+      const trail = comboActions.join(' ');
+      ctx.strokeText(trail, canvas.width / 2, canvas.height * 0.18 + 28);
+      ctx.fillText(trail, canvas.width / 2, canvas.height * 0.18 + 28);
+    }
+  }
+
+  // Duck status indicator
+  ctx.textAlign = 'left';
+  ctx.font = 'bold 16px Segoe UI, Arial, sans-serif';
+  ctx.fillStyle = isStanding ? '#8f8' : '#ff0';
+  ctx.fillText(isStanding ? 'STANDING' : 'DUCKING', pad, canvas.height - pad);
+
+  // Volume meter
+  const vol = getVolume();
+  const volW = 80;
+  const volH = 8;
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  ctx.fillRect(pad, canvas.height - pad + 8, volW, volH);
+  ctx.fillStyle = vol > VOLUME_THRESHOLD ? '#f44' : '#4f4';
+  ctx.fillRect(pad, canvas.height - pad + 8, Math.min(volW, volW * vol / 200), volH);
+}
+
+function drawGameOver(now) {
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 72px Segoe UI, Arial, sans-serif';
+  ctx.fillStyle = '#f44';
+  ctx.strokeStyle = 'rgba(0,0,0,0.8)';
+  ctx.lineWidth = 4;
+  ctx.strokeText('GAME OVER', canvas.width / 2, canvas.height / 2 - 80);
+  ctx.fillText('GAME OVER', canvas.width / 2, canvas.height / 2 - 80);
+
+  ctx.font = 'bold 48px Segoe UI, Arial, sans-serif';
+  ctx.fillStyle = '#fff';
+  ctx.fillText(`SCORE: ${score}`, canvas.width / 2, canvas.height / 2);
+
+  ctx.font = '24px Segoe UI, Arial, sans-serif';
+  ctx.fillStyle = '#ccc';
+  const stats = [
+    `Max Combo: x${maxCombo}`,
+    `Dodges: ${totalDodges}  |  Shots: ${totalShots}  |  Kills: ${totalKills}`,
+    `Phase Reached: ${phase}`,
+  ];
+  stats.forEach((s, i) => {
+    ctx.fillText(s, canvas.width / 2, canvas.height / 2 + 50 + i * 32);
+  });
+
+  ctx.font = 'bold 28px Segoe UI, Arial, sans-serif';
+  ctx.fillStyle = '#ff0';
+  ctx.fillText('Press R to restart', canvas.width / 2, canvas.height / 2 + 180);
+}
+
+// ─── POSE PROCESSING ───
+
+let lastPoseTime = 0;
+function processPose(now) {
+  if (!poseLandmarker || !video.videoWidth) return;
+  if (now - lastPoseTime < 33) return; // ~30fps cap for pose
+  lastPoseTime = now;
+
+  const results = poseLandmarker.detectForVideo(video, now);
+  if (results.landmarks && results.landmarks.length > 0) {
+    const nose = results.landmarks[0][0]; // landmark 0 = nose
+    noseY = nose.y;
+  }
+}
+
+// ─── CALIBRATION ───
+
+let calibrationStartTime = 0;
+
+function startCalibration() {
+  gameState = 'calibrating';
+  calibrationSamples = [];
+  calibrationStartTime = performance.now();
+}
+
+function updateCalibration(now) {
+  calibrationSamples.push(noseY);
+  const elapsed = now - calibrationStartTime;
+  if (elapsed >= 2000 && calibrationSamples.length >= 20) {
+    // Use median for baseline
+    const sorted = [...calibrationSamples].sort((a, b) => a - b);
+    noseBaseline = sorted[Math.floor(sorted.length / 2)];
+    startCountdown(now);
+  }
+}
+
+function startCountdown(now) {
+  gameState = 'countdown';
+  countdownStart = now;
+  countdownValue = 3;
+  playCountdownBeep(false);
+  setTimeout(() => playCountdownBeep(false), 1000);
+  setTimeout(() => playCountdownBeep(false), 2000);
+  setTimeout(() => playCountdownBeep(true), 3000);
+}
+
+function updateCountdown(now) {
+  const elapsed = now - countdownStart;
+  if (elapsed >= 3800) {
+    startPlaying(now);
+  }
+}
+
+function startPlaying(now) {
+  gameState = 'playing';
+  health = MAX_HEALTH;
+  score = 0;
+  combo = 0;
+  maxCombo = 0;
+  comboActions = [];
+  wave = 1;
+  phase = 1;
+  projectilesSpawned = 0;
+  lastSpawnTime = now;
+  invulnUntil = 0;
+  projectiles = [];
+  particles = [];
+  textPopups = [];
+  totalDodges = 0;
+  totalShots = 0;
+  totalKills = 0;
+  borderGlow = 0;
+  muzzleFlash = 0;
+  crosshairPulse = 0;
+}
+
+// ─── MAIN LOOP ───
+
+function gameLoop(timestamp) {
+  const now = timestamp || performance.now();
+
+  resize();
+  processPose(now);
+
+  if (gameState === 'calibrating') updateCalibration(now);
+  else if (gameState === 'countdown') updateCountdown(now);
+  else if (gameState === 'playing') update(now);
+
+  draw(now);
+  requestAnimationFrame(gameLoop);
+}
+
+// ─── RESTART ───
+
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'r' || e.key === 'R') {
+    if (gameState === 'gameover') {
+      startCalibration();
+    }
+  }
+});
+
+// ─── START ───
+
+startBtn.addEventListener('click', async () => {
+  startBtn.disabled = true;
+  startBtn.textContent = 'LOADING...';
+  errorMsg.textContent = '';
+
+  try {
+    await setupWebcam();
+    startBtn.textContent = 'SETTING UP AUDIO...';
+    await setupAudio();
+    startBtn.textContent = 'LOADING AI MODEL...';
+    await setupPose();
+
+    startOverlay.style.display = 'none';
+    startCalibration();
+    requestAnimationFrame(gameLoop);
+  } catch (err) {
+    console.error(err);
+    errorMsg.textContent = `Setup failed: ${err.message}. Make sure to allow camera & microphone access.`;
+    startBtn.disabled = false;
+    startBtn.textContent = 'TRY AGAIN';
+  }
+});
+</script>
+</body>
+</html>

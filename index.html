@@ -353,6 +353,7 @@ resize();
 
 async function setupAudio() {
   audioCtx = new AudioContext();
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
   const source = audioCtx.createMediaStreamSource(stream);
   analyser = audioCtx.createAnalyser();
